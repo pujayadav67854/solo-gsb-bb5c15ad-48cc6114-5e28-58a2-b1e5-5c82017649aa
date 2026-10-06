@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 import math
 from decimal import Decimal
 
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
@@ -33,8 +33,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="数字出版版税结算服务",
-    version="1.5.0",
-    description="阶梯版税计提、作者分成版本、退款冲销、净价更正、关账报表、关账后付款结算、付款冲回（银行退票）与渠道逐笔对账",
+    version="1.6.0",
+    description="阶梯版税计提、作者分成版本、退款冲销、净价更正、关账报表、关账后付款结算、付款冲回（银行退票）、渠道逐笔对账与作品关账贡献查询",
     lifespan=lifespan,
 )
 
@@ -75,7 +75,7 @@ async def validation_error_handler(request: Request, exc: RequestValidationError
 
 @app.get("/", summary="服务信息")
 def root():
-    return {"service": "数字出版版税结算服务", "version": "1.5.0", "docs": "/docs"}
+    return {"service": "数字出版版税结算服务", "version": "1.6.0", "docs": "/docs"}
 
 
 @app.get("/health", summary="健康检查")
@@ -102,6 +102,18 @@ def get_work(work_id: str):
 @app.get("/works/{work_id}/stats", summary="查询作品销量汇总")
 def get_work_stats(work_id: str):
     return ledger.work_stats(work_id)
+
+
+@app.get(
+    "/works/{work_id}/close-contributions",
+    summary="作品关账贡献查询（分批销售/退款/净价更正/价差反向数量、册数、金额与批次净版税，含冻结流水摘要与范围合计）",
+)
+def get_work_close_contributions(
+    work_id: str,
+    from_close: int | None = Query(default=None, ge=1, description="起始关账批次编号（含）"),
+    to_close: int | None = Query(default=None, ge=1, description="截止关账批次编号（含）"),
+):
+    return ledger.work_close_contributions(work_id, from_close, to_close)
 
 
 # ---------------------------------------------------------------- 作者分成版本
