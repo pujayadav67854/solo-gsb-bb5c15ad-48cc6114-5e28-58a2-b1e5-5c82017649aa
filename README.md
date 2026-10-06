@@ -1,6 +1,6 @@
 # 数字出版版税结算服务
 
-基于 **Python / FastAPI + SQLite** 的版税结算服务：作品阶梯费率管理、作者分成版本管理、销售入账计提、作者分账、退款冲销、**销售净价更正（价差补提/冲回）**、关账批次报表、**渠道逐笔回单对账（冻结报告）**、**付款冲回（银行退票）**，支持幂等重试与并发安全。
+基于 **Python / FastAPI + SQLite** 的版税结算服务：作品阶梯费率管理、作者分成版本管理、销售入账计提、作者分账、退款冲销、**销售净价更正（价差补提/冲回）**、关账批次报表、**作品关账贡献查询**、**渠道逐笔回单对账（冻结报告）**、**付款冲回（银行退票）**，支持幂等重试与并发安全。
 
 ## 快速启动
 
@@ -53,6 +53,7 @@ Compose 默认将宿主机 `8000` 映射到容器 `8000`，数据持久化在命
 - **净价更正**：销售净价录错后，财务凭**全局唯一更正编号**、原销售编号与非负新每册净价提交更正。系统按**原销售阶梯费率与入账时分成版本**，仅对各档**未退册数**计算新旧净价的每册版税差额（每册版税仍四舍五入到分）；**逐作者差额 = 未退款总额按新价整体分账 − 按旧价整体分账**（两个总额各自独立分账后相减，余分规则不变）。旧价取该销售的"当前更正价"（首次更正即原价），故可多次串联更正。更正以**独立流水**（独立入账序号）进入**下一关账批次**，**不改写**历史销售、退款、已关账报表与付款。同更正编号同内容重试返回原结果（200），异内容拒绝（409，**编号全局唯一**、跨销售复用也算冲突）；销售不存在 404、**已全退 400**、新价等于当前更正价 409。
 - **更正后退款**：退款本身仍按原销售**末册、原价、原分成版本**冲回，**原有退款字段及金额不变**；同时对**被退册数**另记一条"**已生效价差反向流水**"（同一事务内独立入账序号，随退款归入**同一关账批次**）。各档反向额 =（当前更正价 − 原价）下该档每册价差 × 本次被退册数；逐作者反向额按"未退总额分账之差"**望远镜式**计算（退款前后两个时点各算一次新旧价分账差额再相减），因此**全退后该销售逐作者累计价差恰为 0**（与更正、退款的交错顺序无关）。无已生效价差的退款不产生反向流水（字段为 `null`）；**旧退款不追溯**。更正与退款、关账并发时，按**提交顺序**（数据库提交顺序）判定未退册数与批次归属。
 - **关账**：汇总上次关账之后到本次提交前的全部流水（按入账序号），生成**逐笔明细 + 作者合计**的快照报表，落库后**不可修改**（仅提供只读接口）；关账后补录的旧业务流水自然进入下一批次。
+- **作品关账贡献查询**：调用方提交作品编号及可选关账批次范围 `from_close_id`/`to_close_id`（**起止均含**），返回**每个已冻结关账批次**该作品的销售、退款、净价更正、价差反向流水的**数量、册数与金额、批次净版税**（= 销售 − 退款 + 净价更正 − 价差反向），并列出按**入账顺序**排列的冻结流水摘要（流水类型、编号、所属销售、册数、流水金额与带符号净贡献、分成版本、入账时间），同时返回范围合计。**仅已存在作品可查**（404）；未提供范围时查询全部已冻结批次（范围内无该作品流水的批次仍以零值列出）；起止为非正整数或起点大于终点返回 **422**；范围越过当前最新批次不报错（仅返回存在的批次）。结果**只取关账时刻冻结快照**：未关账流水不计入，后续入账、退款、更正**不影响**历史批次。
 - **付款结算（关账后）**：以作者编号、**当前最新关账批次**编号、付款编号、支付金额（分）提交。应计额 = 截至该批次全部**不可改关账快照**中该作者净额之和；已付额 = 该作者全部已确认付款之和；可付额 = `max(应计额 − 已付额, 0)`。支付金额必须为正且不超过可付额；作者/批次不存在返回 404，批次不是当前最新返回 409。
 - **负余额（待抵扣）**：关账后退款若使应计额低于已付额，差额记为作者的待抵扣负余额，**后续关账的正额先抵扣**，旧报表与旧付款均不改写；负余额未清零时可付额为 0，不能付款。
 - **付款冲回（银行退票）**：银行退票后，财务凭**全局唯一冲回编号**与**原付款编号**登记**整笔付款冲回**（不支持部分冲回，冲回金额恒为原付款金额）。响应返回**关联付款（提交时快照）、冲回金额及登记时的作者结算快照**（应计、冲回前后有效已付、可付、待抵扣负余额、最新批次）。**每笔付款至多冲回一次**；同冲回编号同内容重试返回原结果（HTTP 200），异内容或换编号重复冲回均拒绝（HTTP 409）；原付款不存在返回 404。**有效已付额 = 付款总额 − 冲回总额**；可付额与待抵扣负余额按**最新关账快照**重算（被退回的金额恢复为可付，可重新付款）；原付款及其提交时快照、既有关账报表均保留不改写，后续关账也不改变已登记的冲回结果；冲回记录可在作者结算总览中查询。冲回与新付款并发时按**提交顺序**（同一全局锁 + 单事务）原子判定，不会超付。
@@ -74,6 +75,7 @@ Compose 默认将宿主机 `8000` 映射到容器 `8000`，数据持久化在命
 | POST | `/works` | 录入作品（阶梯费率 + 初始作者分成，即版本 1） |
 | GET | `/works/{work_id}` | 查询作品（展示**当前**分成版本） |
 | GET | `/works/{work_id}/stats` | 作品销量汇总（累计/已退/净册数） |
+| GET | `/works/{work_id}/close-contributions` | 作品关账贡献查询（可选 `?from_close_id=&to_close_id=`，起止均含） |
 | POST | `/works/{work_id}/splits` | 提交作者分成**新版本**（变更编号幂等，按提交顺序生效） |
 | GET | `/works/{work_id}/splits` | 查询当前及历次分成版本 |
 | GET | `/works/{work_id}/splits/{version}` | 查询指定分成版本 |
@@ -183,7 +185,144 @@ curl http://localhost:8000/authors/A2/settlement
 curl http://localhost:8000/authors/A3/settlement
 ```
 
-### 净价更正调用示例
+### 作品关账贡献查询调用示例
+
+```bash
+# 查询作品全部已冻结批次的关账贡献（销售/退款/净价更正/价差反向 + 冻结流水摘要 + 范围合计）
+curl "http://localhost:8000/works/BOOK-1/close-contributions"
+
+# 只查指定关账批次范围（起止均含；可只给 from_close_id 或 to_close_id 一端）
+curl "http://localhost:8000/works/BOOK-1/close-contributions?from_close_id=2&to_close_id=3"
+curl "http://localhost:8000/works/BOOK-1/close-contributions?to_close_id=1"
+
+# 作品不存在 → 404；起点为非正整数/非整数、起点大于终点 → 422
+curl -i "http://localhost:8000/works/NOPE/close-contributions"                       # 404
+curl -i "http://localhost:8000/works/BOOK-1/close-contributions?from_close_id=0"     # 422
+curl -i "http://localhost:8000/works/BOOK-1/close-contributions?from_close_id=3&to_close_id=2"  # 422
+```
+
+响应示例（紧接上文批 1～批 3：批 1 为 S100 销售/退款，批 2 无该作品流水，批 3 为净价更正与更正后退款）：
+
+```json
+{
+  "work_id": "BOOK-1",
+  "from_close_id": 1,
+  "to_close_id": 3,
+  "batches": [
+    {
+      "close_id": 1,
+      "request_id": "CLOSE-2026-09",
+      "created_at": "2026-10-02T00:00:00+00:00",
+      "entry_seq_from": 1,
+      "entry_seq_to": 2,
+      "sales_count": 1,
+      "refunds_count": 1,
+      "price_corrections_count": 0,
+      "price_delta_reversals_count": 0,
+      "sale_copies": 1200,
+      "refunded_copies": 250,
+      "total_sales_royalty_cents": 333600,
+      "total_refund_cents": 79950,
+      "total_price_correction_cents": 0,
+      "total_price_delta_reversal_cents": 0,
+      "batch_net_royalty_cents": 253650,
+      "lines": [
+        {"entry_seq": 1, "type": "sale", "type_label": "销售",
+         "ref_id": "S100", "sale_id": "S100", "copies": 1200,
+         "amount_cents": 333600, "net_contribution_cents": 333600,
+         "split_version": 1, "created_at": "2026-10-01T10:00:00+00:00"},
+        {"entry_seq": 2, "type": "refund", "type_label": "退款",
+         "ref_id": "RF100", "sale_id": "S100", "copies": 250,
+         "amount_cents": 79950, "net_contribution_cents": -79950,
+         "split_version": 1, "created_at": "2026-10-01T11:00:00+00:00"}
+      ]
+    },
+    {
+      "close_id": 2,
+      "request_id": null,
+      "created_at": "2026-10-03T00:00:00+00:00",
+      "entry_seq_from": 3,
+      "entry_seq_to": 3,
+      "sales_count": 0,
+      "refunds_count": 0,
+      "price_corrections_count": 0,
+      "price_delta_reversals_count": 0,
+      "sale_copies": 0,
+      "refunded_copies": 0,
+      "total_sales_royalty_cents": 0,
+      "total_refund_cents": 0,
+      "total_price_correction_cents": 0,
+      "total_price_delta_reversal_cents": 0,
+      "batch_net_royalty_cents": 0,
+      "lines": []
+    },
+    {
+      "close_id": 3,
+      "request_id": "CLOSE-2026-11",
+      "created_at": "2026-10-05T00:00:00+00:00",
+      "entry_seq_from": 4,
+      "entry_seq_to": 6,
+      "sales_count": 0,
+      "refunds_count": 1,
+      "price_corrections_count": 1,
+      "price_delta_reversals_count": 1,
+      "sale_copies": 0,
+      "refunded_copies": 100,
+      "total_sales_royalty_cents": 0,
+      "total_refund_cents": 26700,
+      "total_price_correction_cents": 50350,
+      "total_price_delta_reversal_cents": 5300,
+      "batch_net_royalty_cents": 18350,
+      "lines": [
+        {"entry_seq": 4, "type": "price_correction", "type_label": "净价更正",
+         "ref_id": "COR-2026-10-001", "sale_id": "S100", "copies": 0,
+         "amount_cents": 50350, "net_contribution_cents": 50350,
+         "split_version": 1, "created_at": "2026-10-05T09:00:00+00:00"},
+        {"entry_seq": 5, "type": "refund", "type_label": "退款",
+         "ref_id": "RF102", "sale_id": "S100", "copies": 100,
+         "amount_cents": 26700, "net_contribution_cents": -26700,
+         "split_version": 1, "created_at": "2026-10-05T09:05:00+00:00"},
+        {"entry_seq": 6, "type": "price_delta_reversal", "type_label": "价差反向",
+         "ref_id": "RF102", "sale_id": "S100", "copies": 0,
+         "amount_cents": 5300, "net_contribution_cents": -5300,
+         "split_version": 1, "created_at": "2026-10-05T09:05:00+00:00"}
+      ]
+    }
+  ],
+  "totals": {
+    "sales_count": 1,
+    "refunds_count": 2,
+    "price_corrections_count": 1,
+    "price_delta_reversals_count": 1,
+    "sale_copies": 1200,
+    "refunded_copies": 350,
+    "total_sales_royalty_cents": 333600,
+    "total_refund_cents": 106650,
+    "total_price_correction_cents": 50350,
+    "total_price_delta_reversal_cents": 5300,
+    "batch_net_royalty_cents": 272000,
+    "batches_count": 3
+  }
+}
+```
+
+字段说明：
+
+- `from_close_id` / `to_close_id`：实际生效的批次范围（起止均含）；未提供时分别默认为 `1` 与当前最新批次。无任何已冻结批次时 `to_close_id` 为 `null`、`batches` 为空列表。
+- `batches[]`：范围内**每个已冻结批次**一项，按批次号升序；该批无本作品流水（如批 2）时各计数/册数/金额为 `0`、`lines` 为空。
+- `sales_count` / `refunds_count` / `price_corrections_count` / `price_delta_reversals_count`：四类流水数量；`sale_copies` / `refunded_copies` 为销售册数与退款册数（净价更正与价差反向无册数口径，不计册数）。
+- `total_price_correction_cents` 为带符号更正额合计（补提为正/冲回为负）；`total_price_delta_reversal_cents` 为带符号反向额合计；`batch_net_royalty_cents = total_sales_royalty_cents − total_refund_cents + total_price_correction_cents − total_price_delta_reversal_cents`。
+- `lines[]`：本批该作品的**冻结流水摘要**，按 `entry_seq`（入账顺序）升序。`ref_id` 为流水自身编号（销售/退款/更正编号；价差反向取所属退款编号），`sale_id` 为关联原销售；`amount_cents` 为流水自身金额（销售/退款为非负原额，更正与反向为带符号额），`net_contribution_cents` 为对批次净版税的带符号贡献（销售 +、退款 −、更正按其符号、反向取负号）；`split_version` 为该流水使用的作者分成版本。
+- `totals`：范围合计，逐字段等于各批次之和；`batches_count` 为返回批次数。
+- 全部字段取自**关账时刻冻结快照**：未关账流水不会出现在任何批次；后续入账、退款、更正只影响新批次，历史批次结果不变。
+
+### 错误码（作品关账贡献查询）
+
+| 状态码 | 场景 |
+| --- | --- |
+| 404 | 作品不存在 |
+| 422 | `from_close_id` / `to_close_id` 为非正整数或非整数；或起点大于终点 |
+
 
 ```bash
 # 13. 销售净价录错：凭全局唯一更正编号 + 原销售编号 + 非负新每册净价更正
@@ -592,9 +731,15 @@ pip install -r requirements-dev.txt
 pytest tests/ -q
 ```
 
-覆盖：阶梯计提、分账余分补齐、退款跨段冲回与超退拦截、幂等重试与冲突、关账批次归属与报表不可改、付款结算（过期批次拒绝/超付拦截/幂等重放/负余额抵扣）、并发入账、关账与结算，作者分成版本（校验/幂等与全局冲突/版本查询/入账版本/旧销售退款按原版本分账/退出作者结算/并发变更与入账/旧库迁移），净价更正（各档未退册数差额与独立分账相减/正负差额/幂等与全局冲突/销售不存在·已全退·同价拒绝/更正后退款的价差反向流水与原字段不变/串联更正与全退逐作者归零/更正与反向进入下一批次且历史不改写/按更正编号查询/并发提交顺序/旧库迁移新流水类型），渠道对账（四类逐笔结论与双方原值/汇总、退款取原销售入账价、更正与反向不参与、空回单与空批次核漏报、重复回单号/重复内部流水/区间越界整批拒绝且不落库、非法数值 422、同批次号同内容重放（顺序无关）与异内容 409、报告冻结不受后续流水影响、不改写销售/退款/关账且不占入账序号、区间窗口与多报原因、批次列表/渠道过滤/404、并发提交），以及付款冲回（整笔冲回与登记时结算快照/有效已付额口径与可付恢复/负余额重算/同号重放与换编号重复冲回 409/原付款 404/空编号 422/后续关账不改旧冲回/按作者核算与查询/并发冲回与付款不超付/并发重复冲回至多一笔）。
+覆盖：阶梯计提、分账余分补齐、退款跨段冲回与超退拦截、幂等重试与冲突、关账批次归属与报表不可改、付款结算（过期批次拒绝/超付拦截/幂等重放/负余额抵扣）、并发入账、关账与结算，作者分成版本（校验/幂等与全局冲突/版本查询/入账版本/旧销售退款按原版本分账/退出作者结算/并发变更与入账/旧库迁移），净价更正（各档未退册数差额与独立分账相减/正负差额/幂等与全局冲突/销售不存在·已全退·同价拒绝/更正后退款的价差反向流水与原字段不变/串联更正与全退逐作者归零/更正与反向进入下一批次且历史不改写/按更正编号查询/并发提交顺序/旧库迁移新流水类型），渠道对账（四类逐笔结论与双方原值/汇总、退款取原销售入账价、更正与反向不参与、空回单与空批次核漏报、重复回单号/重复内部流水/区间越界整批拒绝且不落库、非法数值 422、同批次号同内容重放（顺序无关）与异内容 409、报告冻结不受后续流水影响、不改写销售/退款/关账且不占入账序号、区间窗口与多报原因、批次列表/渠道过滤/404、并发提交），以及付款冲回（整笔冲回与登记时结算快照/有效已付额口径与可付恢复/负余额重算/同号重放与换编号重复冲回 409/原付款 404/空编号 422/后续关账不改旧冲回/按作者核算与查询/并发冲回与付款不超付/并发重复冲回至多一笔），作品关账贡献查询（分批四类流水数量/册数/金额/批次净版税口径、摘要按入账顺序与带符号贡献、范围合计等于各批之和、起止均含与可只给一端、未关账不计入且后续入账不影响历史批次、无本作品流水批次零值列出、越界不报错/无批次空结果、404 与 422、跨作品同批互不串账）。
 
-## 本轮变动（v1.5.0）
+## 本轮变动（v1.6.0）
+
+- **新增作品关账贡献查询**：`GET /works/{work_id}/close-contributions`（可选 `?from_close_id=&to_close_id=`，**起止均含**）。按**已冻结关账批次**返回该作品的销售、退款、净价更正、价差反向流水**数量、册数与金额、批次净版税**（销售 − 退款 + 净价更正 − 价差反向），并列出按**入账顺序**排列的冻结流水摘要（`ref_id`/`sale_id`、册数、流水金额与带符号净贡献、分成版本、入账时间），顶层 `totals` 返回范围合计。
+- **范围口径**：未提供范围时查询全部已冻结批次（`from_close_id` 默认 1、`to_close_id` 默认当前最新批次，无批次时为 `null`）；范围内无该作品流水的批次仍以零值列出；范围越过最新批次仅返回存在的批次，不报错。起止为非正整数/非整数或起点大于终点 → **422**；作品不存在 → **404**。
+- **只读、冻结、兼容**：结果完全取自关账时刻落库的 `close_lines` 冻结快照，未关账流水不计入，后续入账/退款/更正不影响历史批次；接口为纯只读，不写任何表、不占用入账序号、不影响关账；既有接口字段与状态码保持不变。启动方式（`uvicorn app.main:app` / Docker）不变，无存储变更。
+
+## 历史变动（v1.5.0）
 
 - **新增付款冲回（银行退票）**：`POST /payment-reversals` 凭**全局唯一冲回编号**与**原付款编号**登记**整笔付款冲回**（不支持部分冲回，冲回金额恒为原付款金额）；`GET /payment-reversals/{reversal_id}` 按冲回编号查询。
 - **响应内容**：关联付款（提交时快照）、冲回金额、登记时的作者结算快照（应计、冲回前后有效已付、可付、待抵扣负余额、最新批次）；快照落库后冻结，后续关账不改变旧冲回结果。
@@ -641,7 +786,7 @@ pytest tests/ -q
 ```
 app/
   main.py            # FastAPI 路由
-  ledger.py          # 核心账务逻辑（计提/分账/退款/更正/关账/付款/付款冲回）
+  ledger.py          # 核心账务逻辑（计提/分账/退款/更正/关账/付款/付款冲回/作品关账贡献查询）
   reconciliation.py  # 渠道逐笔对账（快照核对、冻结报告、幂等）
   db.py              # SQLite 连接与 schema 初始化
   schemas.py         # 请求模型与校验

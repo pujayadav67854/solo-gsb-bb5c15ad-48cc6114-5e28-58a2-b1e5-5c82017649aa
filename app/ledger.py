@@ -1269,6 +1269,195 @@ def list_closes() -> dict:
         }
 
 
+# ---------------------------------------------------------------- 作品关账贡献查询
+
+
+# 作品关账贡献查询中的流水类型中文标签
+WORK_CONTRIBUTION_TYPE_LABELS = {
+    "sale": "销售",
+    "refund": "退款",
+    "price_correction": "净价更正",
+    "price_delta_reversal": "价差反向",
+}
+
+
+def _empty_work_contrib_totals() -> dict:
+    """单个批次/范围合计的零值口径（金额均为分）。"""
+    return {
+        "sales_count": 0,
+        "refunds_count": 0,
+        "price_corrections_count": 0,
+        "price_delta_reversals_count": 0,
+        "sale_copies": 0,  # 销售册数
+        "refunded_copies": 0,  # 退款册数
+        "total_sales_royalty_cents": 0,
+        "total_refund_cents": 0,
+        # 净价更正补提（正）/冲回（负）合计；价差反向流水带符号合计
+        "total_price_correction_cents": 0,
+        "total_price_delta_reversal_cents": 0,
+        # 批次净版税 = 销售 − 退款 + 净价更正 − 价差反向
+        "batch_net_royalty_cents": 0,
+    }
+
+
+def _work_contrib_line_summary(entry_seq: int, payload: dict) -> dict:
+    """关账快照中一条该作品流水的摘要（全部字段取自关账时冻结的 payload）。
+
+    amount_cents 为流水自身金额：销售/退款为非负原额，净价更正与价差反向为
+    带符号金额；net_contribution_cents 为该流水对批次净版税的带符号贡献
+    （销售 +、退款 −、更正按其符号、反向取负号）。
+    """
+    typ = payload["type"]
+    if typ == "sale":
+        copies = payload["copies"]
+        amount = payload["total_royalty_cents"]
+        contribution = amount
+        ref_id = payload["sale_id"]
+    elif typ == "refund":
+        copies = payload["copies"]
+        amount = payload["total_refund_cents"]
+        contribution = -amount
+        ref_id = payload["refund_id"]
+    elif typ == "price_correction":
+        copies = 0
+        amount = payload["total_delta_cents"]  # 带符号：补提为正 / 冲回为负
+        contribution = amount
+        ref_id = payload["correction_id"]
+    else:  # price_delta_reversal
+        copies = 0
+        amount = payload["total_reversal_cents"]  # 带符号：减价差为正 / 补价差为负
+        contribution = -amount  # 关账时按负贡献
+        ref_id = payload["refund_id"]
+    return {
+        "entry_seq": entry_seq,
+        "type": typ,
+        "type_label": WORK_CONTRIBUTION_TYPE_LABELS[typ],
+        "ref_id": ref_id,  # 流水自身编号
+        "sale_id": payload["sale_id"],
+        "copies": copies,
+        "amount_cents": amount,
+        "net_contribution_cents": contribution,
+        "split_version": payload["split_version"],
+        "created_at": payload["created_at"],
+    }
+
+
+def work_close_contributions(
+    work_id: str,
+    from_close_id: int | None = None,
+    to_close_id: int | None = None,
+) -> dict:
+    """作品关账贡献查询：按已冻结关账批次汇总该作品的流水贡献。
+
+    - 仅统计**已关账**流水（close_lines 中的冻结快照），未关账流水不计入结果；
+    - 数据全部取自关账时刻落库的快照 payload，后续入账/退款/更正不影响历史批次；
+    - 批次范围 [from_close_id, to_close_id]（起止均含）；未提供时查询全部已冻结
+      批次（起点 1、终点为当前最新批次）；范围内无该作品流水的批次仍列出（零值）；
+    - 起止为非正整数或起点大于终点 → 422；作品不存在 → 404。
+    """
+    with LOCK:
+        conn = get_conn()
+        if (from_close_id is not None and from_close_id < 1) or (
+            to_close_id is not None and to_close_id < 1
+        ):
+            raise ApiError(422, "关账批次范围非法：起止批次编号必须为正整数")
+        if (
+            from_close_id is not None
+            and to_close_id is not None
+            and from_close_id > to_close_id
+        ):
+            raise ApiError(
+                422,
+                f"关账批次范围非法：起点批次 {from_close_id} 大于终点批次 {to_close_id}",
+            )
+        _load_work(conn, work_id)  # 作品不存在 → 404
+        seq_from = from_close_id or 1
+        seq_to = to_close_id if to_close_id is not None else _latest_close_id(conn)
+
+        batches: list[dict] = []
+        totals = _empty_work_contrib_totals()
+        totals["batches_count"] = 0
+        if seq_to is not None and seq_from <= seq_to:
+            # LEFT JOIN：范围内即使本批无任何流水（空批次）也要列出；
+            # 作品过滤在 Python 侧对冻结 payload 完成（快照即事实，不回查业务表）
+            rows = conn.execute(
+                "SELECT c.close_id AS close_id, c.request_id AS request_id,"
+                " c.created_at AS batch_created_at, c.from_entry_seq AS from_entry_seq,"
+                " c.last_entry_seq AS last_entry_seq, l.entry_seq AS entry_seq,"
+                " l.payload AS payload FROM closes c"
+                " LEFT JOIN close_lines l ON l.close_id=c.close_id"
+                " WHERE c.close_id BETWEEN ? AND ?"
+                " ORDER BY c.close_id, l.entry_seq",
+                (seq_from, seq_to),
+            ).fetchall()
+            current: dict | None = None
+            for r in rows:
+                if current is None or current["close_id"] != r["close_id"]:
+                    current = {
+                        "close_id": r["close_id"],
+                        "request_id": r["request_id"],
+                        "created_at": r["batch_created_at"],
+                        "entry_seq_from": r["from_entry_seq"] + 1,
+                        "entry_seq_to": r["last_entry_seq"],
+                        **_empty_work_contrib_totals(),
+                        "lines": [],
+                    }
+                    batches.append(current)
+                if r["payload"] is None:
+                    continue
+                payload = json.loads(r["payload"])
+                if payload.get("work_id") != work_id:
+                    continue
+                line = _work_contrib_line_summary(r["entry_seq"], payload)
+                current["lines"].append(line)
+                if line["type"] == "sale":
+                    current["sales_count"] += 1
+                    current["sale_copies"] += line["copies"]
+                    current["total_sales_royalty_cents"] += line["amount_cents"]
+                elif line["type"] == "refund":
+                    current["refunds_count"] += 1
+                    current["refunded_copies"] += line["copies"]
+                    current["total_refund_cents"] += line["amount_cents"]
+                elif line["type"] == "price_correction":
+                    current["price_corrections_count"] += 1
+                    current["total_price_correction_cents"] += line["amount_cents"]
+                else:  # price_delta_reversal
+                    current["price_delta_reversals_count"] += 1
+                    current["total_price_delta_reversal_cents"] += line["amount_cents"]
+
+            sum_keys = (
+                "sales_count",
+                "refunds_count",
+                "price_corrections_count",
+                "price_delta_reversals_count",
+                "sale_copies",
+                "refunded_copies",
+                "total_sales_royalty_cents",
+                "total_refund_cents",
+                "total_price_correction_cents",
+                "total_price_delta_reversal_cents",
+            )
+            for b in batches:
+                b["batch_net_royalty_cents"] = (
+                    b["total_sales_royalty_cents"]
+                    - b["total_refund_cents"]
+                    + b["total_price_correction_cents"]
+                    - b["total_price_delta_reversal_cents"]
+                )
+                for k in sum_keys:
+                    totals[k] += b[k]
+                totals["batch_net_royalty_cents"] += b["batch_net_royalty_cents"]
+            totals["batches_count"] = len(batches)
+
+        return {
+            "work_id": work_id,
+            "from_close_id": seq_from,
+            "to_close_id": seq_to,  # 无任何已冻结批次时为 null
+            "batches": batches,
+            "totals": totals,
+        }
+
+
 # ---------------------------------------------------------------- 付款结算
 
 

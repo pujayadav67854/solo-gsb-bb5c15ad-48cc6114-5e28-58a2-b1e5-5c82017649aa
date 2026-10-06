@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 端到端调用示例：录入作品 → 销售 → 退款 → 关账 → 查看报表 → 付款结算
 #              → 作者分成版本变更 → 新版本销售/旧销售退款 → 退出作者结算
-#              → 净价更正 → 渠道对账 → 付款冲回（银行退票）
+#              → 净价更正 → 渠道对账 → 付款冲回（银行退票）→ 作品关账贡献查询
 # 用法：BASE_URL=http://localhost:8000 ./examples/demo.sh
 set -euo pipefail
 
@@ -221,3 +221,15 @@ curl -s "$BASE/authors/A1/settlement" | fmt
 
 echo "== 28. 按冲回编号查询冲回详情（含关联付款快照与登记时结算快照）=="
 curl -s "$BASE/payment-reversals/REV-2026-10-PAY-2026-09-A1" | fmt
+
+echo "== 29. 作品关账贡献查询：全部已冻结批次（分批数量/册数/金额/净版税 + 冻结流水摘要 + 合计）=="
+curl -s "$BASE/works/BOOK-1/close-contributions" | fmt
+
+echo "== 30. 按关账批次范围查询（起止均含，可只给一端；范围内每个批次都列出，含零流水批次）=="
+curl -s "$BASE/works/BOOK-1/close-contributions?from_close_id=1&to_close_id=2" | fmt
+curl -s "$BASE/works/BOOK-1/close-contributions?to_close_id=1" | fmt
+
+echo "== 31. 错误码：作品不存在 404；起点为非正整数 / 起点大于终点 422 =="
+curl -s -o /dev/null -w 'unknown work: %{http_code} (404)\n' "$BASE/works/NOPE/close-contributions"
+curl -s -o /dev/null -w 'from<=0:      %{http_code} (422)\n' "$BASE/works/BOOK-1/close-contributions?from_close_id=0"
+curl -s -o /dev/null -w 'from>to:      %{http_code} (422)\n' "$BASE/works/BOOK-1/close-contributions?from_close_id=3&to_close_id=2"
